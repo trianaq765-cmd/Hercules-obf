@@ -2,7 +2,6 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 import asyncio
-import subprocess
 import os
 import uuid
 import io
@@ -56,7 +55,16 @@ async def download_attachment(att):
     except:
         return None, "Failed to read"
 
-async def run_obfuscator(code, preset='mid'):
+# Preset configurations - using safe modules only
+PRESETS = {
+    'min': ['--varrenaming', '--garbagecode'],
+    'mid': ['--varrenaming', '--garbagecode', '--compressor', '--wrapaliases'],
+    'max': ['--varrenaming', '--garbagecode', '--compressor', '--wrapaliases', '--encaliases', '--vm'],
+    'safe': ['--varrenaming', '--garbagecode'],
+    'vm': ['--varrenaming', '--garbagecode', '--vm'],
+}
+
+async def run_obfuscator(code, preset='mid', custom_flags=None):
     req_id = str(uuid.uuid4())
     input_file = os.path.join(Config.UPLOAD_FOLDER, f'{req_id}.lua')
     
@@ -65,22 +73,48 @@ async def run_obfuscator(code, preset='mid'):
         with open(input_file, 'w') as f:
             f.write(code)
         
-        # Use lua (5.4)
-        cmd = ['lua', 'hercules.lua', input_file, f'--{preset}']
+        # Build command with individual flags instead of preset
+        cmd = ['lua', 'hercules.lua', input_file]
+        
+        if custom_flags:
+            cmd.extend(custom_flags)
+        elif preset in PRESETS:
+            cmd.extend(PRESETS[preset])
+        else:
+            cmd.extend(PRESETS['mid'])
+        
+        print(f"Running: {' '.join(cmd)}")
         
         start = time.time()
         proc = await asyncio.create_subprocess_exec(
             *cmd, cwd=Config.HERCULES_PATH,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            stdout=asyncio.subprocess.PIPE, 
+            stderr=asyncio.subprocess.PIPE
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=Config.OBFUSCATION_TIMEOUT)
         elapsed = time.time() - start
         
-        # Find output
+        stdout_text = stdout.decode() if stdout else ''
+        stderr_text = stderr.decode() if stderr else ''
+        
+        print(f"STDOUT: {stdout_text[:500]}")
+        print(f"STDERR: {stderr_text[:500]}")
+        
+        # Find output file
         output_file = None
-        for p in [input_file.replace('.lua', '_obfuscated.lua'),
-                  os.path.join(Config.HERCULES_PATH, f'{req_id}_obfuscated.lua'),
-                  os.path.join(Config.HERCULES_PATH, os.path.basename(input_file).replace('.lua', '_obfuscated.lua'))]:
+        possible_outputs = [
+            input_file.replace('.lua', '_obfuscated.lua'),
+            os.path.join(Config.HERCULES_PATH, f'{req_id}_obfuscated.lua'),
+            os.path.join(Config.HERCULES_PATH, os.path.basename(input_file).replace('.lua', '_obfuscated.lua')),
+            os.path.join(os.path.dirname(input_file), f'{req_id}_obfuscated.lua'),
+        ]
+        
+        # Also check current working directory
+        for f in os.listdir(Config.HERCULES_PATH):
+            if f.endswith('_obfuscated.lua') and req_id in f:
+                possible_outputs.append(os.path.join(Config.HERCULES_PATH, f))
+        
+        for p in possible_outputs:
             if os.path.exists(p):
                 output_file = p
                 break
@@ -88,65 +122,113 @@ async def run_obfuscator(code, preset='mid'):
         if output_file:
             with open(output_file, 'r') as f:
                 output = f.read()
-            return {'success': True, 'output': output, 'time': f'{elapsed:.2f}s', 'original': len(code), 'obfuscated': len(output)}
-        return {'success': False, 'error': (stderr.decode() if stderr else stdout.decode() if stdout else 'Failed')[:300]}
+            return {
+                'success': True, 
+                'output': output, 
+                'time': f'{elapsed:.2f}s', 
+                'original': len(code), 
+                'obfuscated': len(output)
+            }
+        else:
+            error_msg = stderr_text or stdout_text or 'No output file generated'
+            return {'success': False, 'error': error_msg[:500]}
+            
     except asyncio.TimeoutError:
-        return {'success': False, 'error': 'Timeout'}
+        return {'success': False, 'error': 'Timeout (5 min limit)'}
     except Exception as e:
         return {'success': False, 'error': str(e)}
     finally:
-        for f in [input_file, input_file.replace('.lua', '_obfuscated.lua')]:
+        # Cleanup
+        cleanup_files = [
+            input_file,
+            input_file.replace('.lua', '_obfuscated.lua'),
+        ]
+        for f in cleanup_files:
             if os.path.exists(f):
-                try: os.remove(f)
-                except: pass
+                try: 
+                    os.remove(f)
+                except: 
+                    pass
+
+# ============ SLASH COMMANDS ============
 
 @bot.tree.command(name="obfuscate", description="Obfuscate Lua code")
-@app_commands.describe(code="Lua code", preset="Level", file="Upload file")
+@app_commands.describe(
+    code="Lua code to obfuscate",
+    preset="Obfuscation level",
+    file="Upload .lua file"
+)
 @app_commands.choices(preset=[
-    app_commands.Choice(name="Minimum", value="min"),
-    app_commands.Choice(name="Medium", value="mid"),
-    app_commands.Choice(name="Maximum", value="max"),
+    app_commands.Choice(name="Safe - Basic (most stable)", value="safe"),
+    app_commands.Choice(name="Minimum - Light", value="min"),
+    app_commands.Choice(name="Medium - Balanced", value="mid"),
+    app_commands.Choice(name="Maximum - Heavy", value="max"),
+    app_commands.Choice(name="VM - Virtual Machine", value="vm"),
 ])
-async def slash_obf(interaction: discord.Interaction, code: str = None, preset: str = "mid", file: discord.Attachment = None):
+async def slash_obf(interaction: discord.Interaction, code: str = None, preset: str = "safe", file: discord.Attachment = None):
     on_cd, rem = check_cooldown(interaction.user.id)
     if on_cd:
-        await interaction.response.send_message(embed=create_embed("⏳", f"Wait {rem}s", 0xffc800), ephemeral=True)
+        await interaction.response.send_message(embed=create_embed("⏳ Cooldown", f"Wait {rem}s", 0xffc800), ephemeral=True)
         return
+    
     await interaction.response.defer()
     
     if file:
         content, err = await download_attachment(file)
         if err:
-            await interaction.followup.send(embed=create_embed("❌", err, 0xff6464))
+            await interaction.followup.send(embed=create_embed("❌ Error", err, 0xff6464))
             return
         code = content
     
     if not code:
-        await interaction.followup.send(embed=create_embed("❌", "Provide code or file", 0xff6464))
+        await interaction.followup.send(embed=create_embed("❌ Error", "Provide code or upload a file", 0xff6464))
         return
     
     bot.stats['total'] += 1
-    msg = await interaction.followup.send(embed=create_embed("🔄", f"Preset: `{preset}`", 0xffc800))
+    msg = await interaction.followup.send(embed=create_embed("🔄 Obfuscating", f"**Preset:** `{preset}`\nPlease wait...", 0xffc800))
     
     result = await run_obfuscator(code, preset)
     
     if result['success']:
         bot.stats['success'] += 1
-        inc = ((result['obfuscated']-result['original'])/result['original']*100) if result['original']>0 else 0
-        embed = create_embed("✅ Complete", f"**Time:** `{result['time']}`\n**Size:** `{result['original']:,}` → `{result['obfuscated']:,}` (+{inc:.1f}%)", 0x00ff64)
+        inc = ((result['obfuscated'] - result['original']) / result['original'] * 100) if result['original'] > 0 else 0
+        
+        embed = create_embed(
+            "✅ Obfuscation Complete",
+            f"**Preset:** `{preset}`\n**Time:** `{result['time']}`\n**Size:** `{result['original']:,}` → `{result['obfuscated']:,}` bytes (+{inc:.1f}%)",
+            0x00ff64
+        )
+        
         await msg.edit(embed=embed)
         await interaction.followup.send(file=discord.File(io.BytesIO(result['output'].encode()), filename="obfuscated.lua"))
     else:
         bot.stats['failed'] += 1
-        await msg.edit(embed=create_embed("❌", result['error'][:400], 0xff6464))
+        await msg.edit(embed=create_embed("❌ Failed", result['error'][:500], 0xff6464))
 
-@bot.tree.command(name="obfuscate-max", description="Maximum obfuscation")
-@app_commands.describe(file="Upload .lua file")
-async def slash_max(interaction: discord.Interaction, file: discord.Attachment):
+
+@bot.tree.command(name="obfuscate-custom", description="Obfuscate with custom modules")
+@app_commands.describe(
+    file="Upload .lua file",
+    varrenaming="Variable renaming",
+    garbagecode="Garbage code insertion",
+    compressor="Compress output",
+    vm="Virtual Machine protection",
+    antitamper="Anti-tamper protection"
+)
+async def slash_custom(
+    interaction: discord.Interaction,
+    file: discord.Attachment,
+    varrenaming: bool = True,
+    garbagecode: bool = True,
+    compressor: bool = False,
+    vm: bool = False,
+    antitamper: bool = False
+):
     on_cd, rem = check_cooldown(interaction.user.id)
     if on_cd:
         await interaction.response.send_message(embed=create_embed("⏳", f"Wait {rem}s", 0xffc800), ephemeral=True)
         return
+    
     await interaction.response.defer()
     
     content, err = await download_attachment(file)
@@ -154,36 +236,133 @@ async def slash_max(interaction: discord.Interaction, file: discord.Attachment):
         await interaction.followup.send(embed=create_embed("❌", err, 0xff6464))
         return
     
-    bot.stats['total'] += 1
-    msg = await interaction.followup.send(embed=create_embed("🔄", "Max obfuscation...", 0xffc800))
+    # Build custom flags
+    flags = []
+    if varrenaming:
+        flags.append('--varrenaming')
+    if garbagecode:
+        flags.append('--garbagecode')
+    if compressor:
+        flags.append('--compressor')
+    if vm:
+        flags.append('--vm')
+    if antitamper:
+        flags.append('--antitamper')
     
-    result = await run_obfuscator(content, 'max')
+    if not flags:
+        flags = ['--varrenaming']  # At least one module
+    
+    bot.stats['total'] += 1
+    
+    enabled = ", ".join([f.replace('--', '') for f in flags])
+    msg = await interaction.followup.send(embed=create_embed("🔄 Custom Obfuscation", f"**Modules:** {enabled}", 0xffc800))
+    
+    result = await run_obfuscator(content, custom_flags=flags)
     
     if result['success']:
         bot.stats['success'] += 1
-        await msg.edit(embed=create_embed("✅", f"Size: `{result['original']:,}` → `{result['obfuscated']:,}`", 0x00ff64))
-        await interaction.followup.send(file=discord.File(io.BytesIO(result['output'].encode()), filename=f"max_{file.filename}"))
+        embed = create_embed(
+            "✅ Complete",
+            f"**Modules:** {enabled}\n**Time:** `{result['time']}`\n**Size:** `{result['original']:,}` → `{result['obfuscated']:,}`",
+            0x00ff64
+        )
+        await msg.edit(embed=embed)
+        await interaction.followup.send(file=discord.File(io.BytesIO(result['output'].encode()), filename=f"custom_{file.filename}"))
     else:
         bot.stats['failed'] += 1
-        await msg.edit(embed=create_embed("❌", result['error'][:400], 0xff6464))
+        await msg.edit(embed=create_embed("❌", result['error'][:500], 0xff6464))
 
-@bot.tree.command(name="help", description="Help")
+
+@bot.tree.command(name="help", description="Show help")
 async def slash_help(interaction: discord.Interaction):
-    embed = create_embed("🛡️ Hercules", "Lua Obfuscator")
-    embed.add_field(name="Commands", value="`/obfuscate` - Obfuscate\n`/obfuscate-max` - Max protection\n`!obf <code>` - Quick", inline=False)
-    embed.add_field(name="Presets", value="`min` `mid` `max`", inline=False)
+    embed = create_embed("🛡️ Hercules Obfuscator", "Lua Code Obfuscation Tool")
+    
+    embed.add_field(
+        name="📝 Commands",
+        value="""
+`/obfuscate` - Obfuscate with presets
+`/obfuscate-custom` - Custom module selection
+`/modules` - List available modules
+`/stats` - View statistics
+        """,
+        inline=False
+    )
+    
+    embed.add_field(
+        name="⚡ Presets",
+        value="""
+`safe` - Variable Renaming + Garbage Code (stable)
+`min` - Same as safe
+`mid` - + Compressor, Wrap Aliases
+`max` - + VM, Enc Aliases
+`vm` - Variable Renaming + VM
+        """,
+        inline=False
+    )
+    
+    embed.add_field(
+        name="💬 Quick Commands",
+        value="`!obf <code>` - Quick obfuscate with safe preset",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="⚠️ Note",
+        value="Use `safe` preset if other presets cause errors. Some modules may conflict with certain Lua code.",
+        inline=False
+    )
+    
     await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="stats", description="Statistics")
+
+@bot.tree.command(name="modules", description="List available modules")
+async def slash_modules(interaction: discord.Interaction):
+    embed = create_embed("🔧 Available Modules", "")
+    
+    modules_info = """
+✅ **Stable Modules:**
+• `varrenaming` - Rename variables to random names
+• `garbagecode` - Insert fake/dead code
+• `compressor` - Compress the output
+
+⚠️ **May Cause Issues:**
+• `controlflow` - Control flow obfuscation
+• `stringencoding` - Encode strings
+• `opaquepredicates` - Add confusing conditions
+
+🔒 **Advanced:**
+• `vm` - Virtual Machine protection
+• `antitamper` - Tamper detection
+• `wrapaliases` - Wrap function aliases
+• `encaliases` - Encode aliases
+    """
+    
+    embed.description = modules_info
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="stats", description="View statistics")
 async def slash_stats(interaction: discord.Interaction):
     up = datetime.utcnow() - bot.start_time
     h, r = divmod(int(up.total_seconds()), 3600)
     m, s = divmod(r, 60)
-    embed = create_embed("📊 Stats", "")
+    d, h = divmod(h, 24)
+    uptime = f"{d}d {h}h {m}m" if d else f"{h}h {m}m {s}s"
+    
+    rate = (bot.stats['success'] / bot.stats['total'] * 100) if bot.stats['total'] > 0 else 0
+    
+    embed = create_embed("📊 Statistics", "")
     embed.add_field(name="Total", value=f"`{bot.stats['total']}`", inline=True)
     embed.add_field(name="Success", value=f"`{bot.stats['success']}`", inline=True)
+    embed.add_field(name="Failed", value=f"`{bot.stats['failed']}`", inline=True)
+    embed.add_field(name="Rate", value=f"`{rate:.1f}%`", inline=True)
     embed.add_field(name="Servers", value=f"`{len(bot.guilds)}`", inline=True)
+    embed.add_field(name="Uptime", value=f"`{uptime}`", inline=True)
+    
     await interaction.response.send_message(embed=embed)
+
+
+# ============ PREFIX COMMANDS ============
 
 @bot.command(name='obf')
 async def cmd_obf(ctx, *, code: str = None):
@@ -193,34 +372,89 @@ async def cmd_obf(ctx, *, code: str = None):
             await ctx.send(embed=create_embed("❌", err, 0xff6464))
             return
         code = content
+    
     if not code:
-        await ctx.send(embed=create_embed("❌", "`!obf <code>` or attach file", 0xff6464))
+        await ctx.send(embed=create_embed("❌ Error", "Usage: `!obf <code>` or attach a file", 0xff6464))
         return
+    
     on_cd, rem = check_cooldown(ctx.author.id)
     if on_cd:
         await ctx.send(embed=create_embed("⏳", f"Wait {rem}s", 0xffc800))
         return
+    
     bot.stats['total'] += 1
-    msg = await ctx.send(embed=create_embed("🔄", "Processing...", 0xffc800))
-    result = await run_obfuscator(code)
+    msg = await ctx.send(embed=create_embed("🔄 Obfuscating", "Using safe preset...", 0xffc800))
+    
+    result = await run_obfuscator(code, 'safe')
+    
     if result['success']:
         bot.stats['success'] += 1
-        await msg.edit(embed=create_embed("✅", f"Time: `{result['time']}`", 0x00ff64))
+        await msg.edit(embed=create_embed("✅ Complete", f"**Time:** `{result['time']}`\n**Size:** `{result['original']:,}` → `{result['obfuscated']:,}`", 0x00ff64))
         await ctx.send(file=discord.File(io.BytesIO(result['output'].encode()), filename="obfuscated.lua"))
     else:
         bot.stats['failed'] += 1
-        await msg.edit(embed=create_embed("❌", result['error'][:300], 0xff6464))
+        await msg.edit(embed=create_embed("❌ Failed", result['error'][:500], 0xff6464))
+
+
+@bot.command(name='obf-vm')
+async def cmd_vm(ctx):
+    if not ctx.message.attachments:
+        await ctx.send(embed=create_embed("❌", "Attach a .lua file", 0xff6464))
+        return
+    
+    content, err = await download_attachment(ctx.message.attachments[0])
+    if err:
+        await ctx.send(embed=create_embed("❌", err, 0xff6464))
+        return
+    
+    on_cd, rem = check_cooldown(ctx.author.id)
+    if on_cd:
+        await ctx.send(embed=create_embed("⏳", f"Wait {rem}s", 0xffc800))
+        return
+    
+    bot.stats['total'] += 1
+    msg = await ctx.send(embed=create_embed("🔄 VM Obfuscation", "Applying VM protection...", 0xffc800))
+    
+    result = await run_obfuscator(content, 'vm')
+    
+    if result['success']:
+        bot.stats['success'] += 1
+        await msg.edit(embed=create_embed("✅ Complete", f"Size: `{result['original']:,}` → `{result['obfuscated']:,}`", 0x00ff64))
+        await ctx.send(file=discord.File(io.BytesIO(result['output'].encode()), filename="vm_obfuscated.lua"))
+    else:
+        bot.stats['failed'] += 1
+        await msg.edit(embed=create_embed("❌ Failed", result['error'][:500], 0xff6464))
+
 
 @bot.command(name='help')
 async def cmd_help(ctx):
-    await ctx.send(embed=create_embed("🛡️", "`/obfuscate` or `!obf <code>`"))
+    embed = create_embed("🛡️ Hercules", "")
+    embed.add_field(name="Commands", value="`/obfuscate` - Main command\n`!obf <code>` - Quick\n`!obf-vm` - With VM (attach file)", inline=False)
+    await ctx.send(embed=embed)
+
 
 @bot.event
 async def on_command_error(ctx, error):
-    if isinstance(error, commands.CommandNotFound): return
+    if isinstance(error, commands.CommandNotFound):
+        return
+    await ctx.send(embed=create_embed("❌", str(error)[:200], 0xff6464))
+
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error):
+    try:
+        msg = str(error)[:200]
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=create_embed("❌", msg, 0xff6464), ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=create_embed("❌", msg, 0xff6464), ephemeral=True)
+    except:
+        pass
+
 
 if __name__ == '__main__':
     if not Config.DISCORD_TOKEN:
-        print("ERROR: No token!")
+        print("ERROR: DISCORD_TOKEN not set!")
         exit(1)
+    print("Starting Hercules Obfuscator Bot...")
     bot.run(Config.DISCORD_TOKEN)
