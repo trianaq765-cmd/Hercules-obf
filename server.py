@@ -3,19 +3,13 @@ import subprocess
 import os
 import uuid
 import time
+import re
 from config import Config
 
 app = Flask(__name__)
 
 os.makedirs(Config.UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(Config.OUTPUT_FOLDER, exist_ok=True)
-
-# Safe presets using individual flags
-PRESETS = {
-    'min': ['--varrenaming', '--garbagecode'],
-    'mid': ['--varrenaming', '--garbagecode', '--compressor'],
-    'max': ['--varrenaming', '--garbagecode', '--compressor', '--vm'],
-}
 
 HTML = '''
 <!DOCTYPE html>
@@ -39,7 +33,6 @@ HTML = '''
         .success{background:rgba(0,255,100,0.1);border:1px solid #00ff64;color:#00ff64;display:block}
         .error{background:rgba(255,0,0,0.1);border:1px solid #ff6464;color:#ff6464;display:block}
         .loading{background:rgba(255,200,0,0.1);border:1px solid #ffc800;color:#ffc800;display:block}
-        .note{background:rgba(255,200,0,0.1);padding:10px;border-radius:8px;margin:15px 0;font-size:14px;color:#ffc800}
     </style>
 </head>
 <body>
@@ -51,12 +44,10 @@ HTML = '''
             
             <label>⚡ Preset</label>
             <select id="preset">
-                <option value="min">Minimum - Variable Renaming + Garbage Code</option>
-                <option value="mid" selected>Medium - + Compressor</option>
-                <option value="max">Maximum - + Virtual Machine</option>
+                <option value="min" selected>Minimum - Light obfuscation</option>
+                <option value="mid">Medium - Balanced</option>
+                <option value="max">Maximum - Heavy obfuscation</option>
             </select>
-            
-            <div class="note">💡 If you get errors, try "Minimum" preset which is most stable.</div>
             
             <button class="btn" id="btn" onclick="obfuscate()">🛡️ Obfuscate</button>
             
@@ -129,23 +120,29 @@ def api_obfuscate():
         if not code:
             return jsonify({'success': False, 'error': 'No code provided'})
         
+        # Validate preset
+        if preset not in ['min', 'mid', 'max']:
+            preset = 'min'
+        
         req_id = str(uuid.uuid4())
         input_file = os.path.join(Config.UPLOAD_FOLDER, f'{req_id}.lua')
         
         with open(input_file, 'w') as f:
             f.write(code)
         
-        # Build command with individual flags
-        cmd = ['lua', 'hercules.lua', input_file]
-        if preset in PRESETS:
-            cmd.extend(PRESETS[preset])
-        else:
-            cmd.extend(PRESETS['min'])
+        # Use correct preset flags
+        cmd = ['lua', 'hercules.lua', input_file, f'--{preset}']
         
         print(f"Running: {' '.join(cmd)}")
         
         start = time.time()
-        result = subprocess.run(cmd, cwd=Config.HERCULES_PATH, capture_output=True, text=True, timeout=Config.OBFUSCATION_TIMEOUT)
+        result = subprocess.run(
+            cmd, 
+            cwd=Config.HERCULES_PATH, 
+            capture_output=True, 
+            text=True, 
+            timeout=Config.OBFUSCATION_TIMEOUT
+        )
         elapsed = time.time() - start
         
         print(f"STDOUT: {result.stdout[:500] if result.stdout else 'None'}")
@@ -153,11 +150,21 @@ def api_obfuscate():
         
         # Find output file
         output_file = None
+        base_name = os.path.basename(input_file).replace('.lua', '_obfuscated.lua')
+        
         possible = [
             input_file.replace('.lua', '_obfuscated.lua'),
+            os.path.join(Config.HERCULES_PATH, base_name),
             os.path.join(Config.HERCULES_PATH, f'{req_id}_obfuscated.lua'),
-            os.path.join(Config.HERCULES_PATH, os.path.basename(input_file).replace('.lua', '_obfuscated.lua')),
         ]
+        
+        # Scan hercules directory
+        try:
+            for f in os.listdir(Config.HERCULES_PATH):
+                if '_obfuscated.lua' in f:
+                    possible.append(os.path.join(Config.HERCULES_PATH, f))
+        except:
+            pass
         
         for p in possible:
             if os.path.exists(p):
@@ -167,8 +174,11 @@ def api_obfuscate():
         if output_file:
             with open(output_file, 'r') as f:
                 output = f.read()
+            
+            # Cleanup
             os.remove(input_file)
             os.remove(output_file)
+            
             return jsonify({
                 'success': True,
                 'output': output,
@@ -178,7 +188,9 @@ def api_obfuscate():
             })
         else:
             os.remove(input_file) if os.path.exists(input_file) else None
-            error = result.stderr or result.stdout or 'No output file. Try "Minimum" preset.'
+            error = result.stderr or result.stdout or 'No output file generated'
+            # Remove ANSI color codes
+            error = re.sub(r'\x1b\[[0-9;]*m', '', error)
             return jsonify({'success': False, 'error': error[:500]})
             
     except subprocess.TimeoutExpired:
